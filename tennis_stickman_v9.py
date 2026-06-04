@@ -1,6 +1,6 @@
-# 테니스 동작 영상을 스틱맨 애니메이션으로 변환하는 생성기 (v10: TrackNet 딥러닝 공 추적 임팩트 감지)
+# 테니스 동작 영상을 스틱맨 애니메이션으로 변환하는 생성기 (v9: 원본 오디오 합성 + 양손 백핸드 그립)
 """
-Tennis Stickman Animation Generator v10 (TrackNet Ball Tracking)
+Tennis Stickman Animation Generator v9 (Original Audio + Two-Handed Grip)
 사용법:
   python tennis_stickman_v9.py <YouTube_URL_또는_로컬파일> <동작명> [--left] [--speed <배속>] [--strobe] [--two-handed]
 
@@ -46,10 +46,7 @@ def parse_args():
     parser.add_argument("--no-trail", action="store_true", help="네온 스윙 궤적(노란색/파란색 선) 표시 비활성화")
     parser.add_argument("--two-handed", action="store_true", help="양손 그립 모드: 왼손을 라켓 그립 위에 배치하고 와이퍼 물리 비활성화")
     parser.add_argument("--audio-impact", action="store_true", help="오디오 타구음 기반 임팩트 감지 (가장 정확)")
-    parser.add_argument("--ball-track", action="store_true", help="TrackNet 딥러닝 공 추적 기반 임팩트 감지")
-    parser.add_argument("--tracknet-model", type=str,
-                        default=r"C:\TrackNet\model_best.pt",
-                        help="TrackNet 가중치 파일 경로 (기본: Desktop/model_best.pt)")
+    parser.add_argument("--ball-track", action="store_true", help="HSV 공 추적 기반 임팩트 감지 (공 방향 반전 감지)")
     parser.add_argument("--impact-frame", type=int, nargs="+", default=None,
                         metavar="N", help="임팩트 프레임 번호 직접 지정 (예: --impact-frame 690 또는 여러 개: 300 690)")
     return parser.parse_args()
@@ -1086,7 +1083,7 @@ def draw_stickman(canvas, landmarks, w, h, is_right_handed=True, racket_trail=No
 
     h_wrist_y = r_wrist[1] if is_right_handed else l_wrist[1]
     is_occluded = False
-    if (is_serve and current_phase == "Racket Drop") or (is_arm_behind_geom and is_arm_behind_z):
+    if (is_serve and current_phase == "Racket Drop") or is_arm_behind_geom:
         if h_wrist_y > head_cy:
             is_occluded = True
     elif is_arm_behind_z:
@@ -1162,166 +1159,6 @@ def correct_leg_swaps(landmarks, prev_landmarks):
             landmarks[r_idx].x, landmarks[r_idx].y, landmarks[r_idx].z = lx, ly, lz
             
     return landmarks
-
-
-# ─────────────────────────────────────────
-# TrackNet 딥러닝 공 추적 (v10 신규)
-# ─────────────────────────────────────────
-
-try:
-    import torch
-    import torch.nn as nn
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
-
-
-class _ConvBlock(nn.Module if _TORCH_AVAILABLE else object):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        import torch.nn as nn
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(out_ch)
-        )
-    def forward(self, x):
-        return self.block(x)
-
-
-class BallTrackerNet(nn.Module if _TORCH_AVAILABLE else object):
-    """TrackNet — 3프레임 9ch 입력 → 공 위치 히트맵"""
-    def __init__(self, out_channels=256):
-        super().__init__()
-        import torch.nn as nn
-        self.out_channels = out_channels
-        self.conv1  = _ConvBlock(9, 64);   self.conv2  = _ConvBlock(64, 64)
-        self.pool1  = nn.MaxPool2d(2, 2)
-        self.conv3  = _ConvBlock(64, 128); self.conv4  = _ConvBlock(128, 128)
-        self.pool2  = nn.MaxPool2d(2, 2)
-        self.conv5  = _ConvBlock(128, 256); self.conv6 = _ConvBlock(256, 256); self.conv7 = _ConvBlock(256, 256)
-        self.pool3  = nn.MaxPool2d(2, 2)
-        self.conv8  = _ConvBlock(256, 512); self.conv9 = _ConvBlock(512, 512); self.conv10 = _ConvBlock(512, 512)
-        self.ups1   = nn.Upsample(scale_factor=2)
-        self.conv11 = _ConvBlock(512, 256); self.conv12 = _ConvBlock(256, 256); self.conv13 = _ConvBlock(256, 256)
-        self.ups2   = nn.Upsample(scale_factor=2)
-        self.conv14 = _ConvBlock(256, 128); self.conv15 = _ConvBlock(128, 128)
-        self.ups3   = nn.Upsample(scale_factor=2)
-        self.conv16 = _ConvBlock(128, 64);  self.conv17 = _ConvBlock(64, 64)
-        self.conv18 = _ConvBlock(64, out_channels)
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x, testing=False):
-        b = x.size(0)
-        x = self.pool1(self.conv2(self.conv1(x)))
-        x = self.pool2(self.conv4(self.conv3(x)))
-        x = self.pool3(self.conv7(self.conv6(self.conv5(x))))
-        x = self.conv10(self.conv9(self.conv8(x)))
-        x = self.conv13(self.conv12(self.conv11(self.ups1(x))))
-        x = self.conv15(self.conv14(self.ups2(x)))
-        x = self.conv18(self.conv17(self.conv16(self.ups3(x))))
-        out = x.reshape(b, self.out_channels, -1)
-        if testing:
-            out = self.softmax(out)
-        return out
-
-
-def _tracknet_postprocess(feature_map, w=640):
-    """히트맵 argmax 배열 → (x, y) 0~1 정규화 좌표"""
-    h = feature_map.shape[0] // w
-    fm = (feature_map * 255).reshape(h, w).astype(np.uint8)
-    _, hm = cv2.threshold(fm, 127, 255, cv2.THRESH_BINARY)
-    circles = cv2.HoughCircles(hm, cv2.HOUGH_GRADIENT, dp=1, minDist=1,
-                               param1=50, param2=2, minRadius=2, maxRadius=7)
-    if circles is not None and len(circles) == 1:
-        return circles[0][0][0] / w, circles[0][0][1] / h  # 정규화 좌표
-    return None, None
-
-
-def detect_impacts_from_tracknet(video_path, fps, n_frames, model_path, min_gap_sec=1.5):
-    """TrackNet으로 공 추적 → x방향 속도 반전 = 임팩트"""
-    if not _TORCH_AVAILABLE:
-        print("[!] PyTorch 미설치 — pip install torch 실행 후 재시도")
-        return []
-
-    import torch
-    print(f"[i] TrackNet 공 추적 분석 중... (model: {model_path})")
-
-    device = 'cpu'
-    model = BallTrackerNet()
-    try:
-        state = torch.load(model_path, map_location=device)
-        model.load_state_dict(state)
-    except Exception as e:
-        print(f"[!] 모델 로드 실패: {e}")
-        return []
-    model.to(device).eval()
-
-    cap = cv2.VideoCapture(video_path)
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-    cap.release()
-
-    TW, TH = 320, 180  # 절반 해상도로 4배 빠름 (8의 배수)
-    ball_track = [(None, None)] * 2  # 첫 2프레임은 이전 프레임이 없어 건너뜀
-
-    with torch.no_grad():
-        for i in range(2, len(frames)):
-            imgs = np.concatenate([
-                cv2.resize(frames[i],   (TW, TH)),
-                cv2.resize(frames[i-1], (TW, TH)),
-                cv2.resize(frames[i-2], (TW, TH)),
-            ], axis=2).astype(np.float32) / 255.0
-            inp = torch.from_numpy(np.rollaxis(imgs, 2, 0)[None]).float()
-            out = model(inp, testing=True)
-            feat = out.argmax(dim=1).detach().cpu().numpy()[0]
-            xn, yn = _tracknet_postprocess(feat, w=TW)
-
-            if xn is not None:
-                # 정규화 좌표 → 실제 영상 픽셀 좌표
-                ball_track.append((xn * actual_w, yn * actual_h))
-            else:
-                ball_track.append((None, None))
-
-            if i % 100 == 0:
-                det = sum(1 for p in ball_track if p[0] is not None)
-                print(f"  TrackNet: frame {i}/{n_frames} (공 감지: {det}프레임)")
-
-    det = sum(1 for p in ball_track if p[0] is not None)
-    print(f"[i] 공 감지 프레임: {det}/{n_frames} ({det/n_frames*100:.1f}%)")
-
-    if det < n_frames * 0.03:
-        print("[!] 공 감지율 3% 미만")
-        return []
-
-    # x방향 속도 (window=3)
-    win = 3
-    vx = [None] * len(ball_track)
-    for i in range(win, len(ball_track) - win):
-        pa, pb = ball_track[i - win], ball_track[i + win]
-        if pa[0] and pb[0]:
-            vx[i] = pb[0] - pa[0]
-
-    # 속도 반전 = 임팩트
-    min_gap = int(min_gap_sec * fps)
-    impact_points = []
-    for i in range(win, len(vx) - 1):
-        if vx[i] is None or vx[i + 1] is None:
-            continue
-        if vx[i] * vx[i + 1] < 0 and (abs(vx[i]) + abs(vx[i + 1])) > 15:
-            if not impact_points or i - impact_points[-1] >= min_gap:
-                impact_points.append(i)
-                print(f"[✓] TrackNet impact: f{i} "
-                      f"(t={i/fps:.2f}s, vx: {vx[i]:+.1f}→{vx[i+1]:+.1f}, "
-                      f"pos={ball_track[i]})")
-
-    return impact_points
 
 
 # ─────────────────────────────────────────
@@ -1517,8 +1354,7 @@ def detect_impacts_from_audio(video_path, fps, n_frames, min_gap_sec=1.0, thresh
 # ─────────────────────────────────────────
 
 def process_video(video_url, name, is_right_handed, label=None, desc=None, speed=1.0,
-                  strobe=False, strobe_frames=32, strobe_step=4, lag_scale=1.0, no_trail=False, two_handed=False,
-                  audio_impact=False, ball_track=False, impact_frames=None, tracknet_model=None):
+                  strobe=False, strobe_frames=32, strobe_step=4, lag_scale=1.0, no_trail=False, two_handed=False, audio_impact=False, ball_track=False, impact_frames=None):
     global _racket_offset_prev, _racket_face_prev, _shoe_blend_cache
     # 양손 백핸드는 와이퍼 물리가 어울리지 않으므로 lag_scale 강제 0
     if two_handed:
@@ -1554,7 +1390,7 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
-        num_poses=2,
+        num_poses=1,
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -1581,8 +1417,7 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
                     all_smoothed_landmarks.append(None)
                 else:
                     all_smoothed_landmarks.append([
-                        SimpleNamespace(x=lm["x"], y=lm["y"], z=lm["z"],
-                                        v=lm.get("v", 1.0))
+                        SimpleNamespace(x=lm["x"], y=lm["y"], z=lm["z"])
                         for lm in frame_data
                     ])
             if len(all_smoothed_landmarks) == total_frames:
@@ -1616,26 +1451,14 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
             
             smoothed = None
             if result.pose_landmarks and len(result.pose_landmarks) > 0:
-                # 여러 인물 중 화면 하단(hip_y 최대) 선수 선택
-                best_idx = 0
-                best_hip_y = -1.0
-                for pi, pose_lm in enumerate(result.pose_landmarks):
-                    hip_y = (pose_lm[L_HIP].y + pose_lm[R_HIP].y) / 2.0
-                    if hip_y > best_hip_y:
-                        best_hip_y = hip_y
-                        best_idx = pi
-                if best_hip_y < 0.35:
-                    pass  # 상단 다른 선수만 감지됨 → 건너뜀
-                else:
-                    raw_landmarks = result.pose_landmarks[best_idx]
-                    mutable_landmarks = [
-                        SimpleNamespace(x=lm.x, y=lm.y, z=lm.z,
-                                        v=lm.visibility if hasattr(lm, 'visibility') else 1.0)
-                        for lm in raw_landmarks
-                    ]
-                    mutable_landmarks = correct_leg_swaps(mutable_landmarks, prev_raw_landmarks)
-                    prev_raw_landmarks = mutable_landmarks
-                    smoothed = smoother.apply(mutable_landmarks)
+                raw_landmarks = result.pose_landmarks[0]
+                mutable_landmarks = [
+                    SimpleNamespace(x=lm.x, y=lm.y, z=lm.z)
+                    for lm in raw_landmarks
+                ]
+                mutable_landmarks = correct_leg_swaps(mutable_landmarks, prev_raw_landmarks)
+                prev_raw_landmarks = mutable_landmarks
+                smoothed = smoother.apply(mutable_landmarks)
                 
             all_smoothed_landmarks.append(smoothed)
             frame_idx += 1
@@ -1653,8 +1476,7 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
                     serialized_data.append(None)
                 else:
                     serialized_data.append([
-                        {"x": lm.x, "y": lm.y, "z": lm.z,
-                         "v": getattr(lm, "v", 1.0)}
+                        {"x": lm.x, "y": lm.y, "z": lm.z}
                         for lm in frame_data
                     ])
             with open(cache_path, "w", encoding="utf-8") as f:
@@ -1662,40 +1484,6 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
             print(f"[✓] Saved pose landmarks cache to: {cache_path}")
         except Exception as e:
             print(f"[✗] Failed to save cache: {e}")
-
-    # 다리 랜드마크 안정화 (hip~foot_index 인덱스 23~32)
-    # 1단계: visibility < 0.5 프레임은 마지막 신뢰 값으로 대체
-    # 2단계: ±3프레임 이동평균으로 잔여 노이즈 제거
-    LEG_IDX = list(range(23, 33))
-    VIS_THRESH = 0.5
-    LEG_WIN = 3
-    n_frames_total = len(all_smoothed_landmarks)
-
-    for idx in LEG_IDX:
-        # 1단계: visibility 기반 대체
-        last_x, last_y = None, None
-        for lm in all_smoothed_landmarks:
-            if lm is None:
-                continue
-            vis = getattr(lm[idx], 'v', 1.0)
-            if vis >= VIS_THRESH:
-                last_x, last_y = lm[idx].x, lm[idx].y
-            elif last_x is not None:
-                lm[idx].x, lm[idx].y = last_x, last_y
-
-        # 2단계: 이동평균 스무딩
-        xs = [lm[idx].x if lm is not None else None for lm in all_smoothed_landmarks]
-        ys = [lm[idx].y if lm is not None else None for lm in all_smoothed_landmarks]
-        for i, lm in enumerate(all_smoothed_landmarks):
-            if lm is None:
-                continue
-            lo, hi = max(0, i - LEG_WIN), min(n_frames_total, i + LEG_WIN + 1)
-            wx = [v for v in xs[lo:hi] if v is not None]
-            wy = [v for v in ys[lo:hi] if v is not None]
-            if wx:
-                lm[idx].x = sum(wx) / len(wx)
-            if wy:
-                lm[idx].y = sum(wy) / len(wy)
 
     # 임팩트 후보 분석
     impact_points = []
@@ -1705,12 +1493,9 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
         print(f"[✓] 수동 지정 임팩트 프레임: {impact_points}")
 
     if not impact_points and ball_track:
-        impact_points = detect_impacts_from_tracknet(
-            actual_input, fps, total_frames,
-            model_path=tracknet_model or r"C:\TrackNet\model_best.pt"
-        )
+        impact_points = detect_impacts_from_ball(actual_input, fps, total_frames)
         if not impact_points:
-            print("[!] TrackNet 공 추적 실패, 팔 신장 방식으로 대체")
+            print("[!] 공 추적 실패, 팔 신장 방식으로 대체")
 
     if not impact_points and audio_impact:
         # ── 오디오 + 랜드마크 이중 검증 감지 ──
@@ -2040,7 +1825,7 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
         
         # 임팩트 순간 효과: 임팩트 직전 2프레임부터 임팩트 후 4프레임까지 표시 (총 6프레임)
         for imp_f in impact_points:
-            if -6 <= frame_idx - imp_f < 30:
+            if -6 <= frame_idx - imp_f < 0:
                 cv2.putText(final, "IMPACT!", (out_w // 2 - 160, out_h - 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 2.5, (20, 20, 20), 8, cv2.LINE_AA)
                 cv2.putText(final, "IMPACT!", (out_w // 2 - 160, out_h - 80),
@@ -2112,7 +1897,7 @@ def process_video(video_url, name, is_right_handed, label=None, desc=None, speed
 if __name__ == "__main__":
     args = parse_args()
     print("=" * 60)
-    print(f"  TENNIS STICKMAN ANIMATION GENERATOR v10")
+    print(f"  TENNIS STICKMAN ANIMATION GENERATOR v9")
     print(f"  동작: {args.name}  |  손: {'왼손' if args.left else '오른손'}  |  배속: {args.speed}x  |  잔상: {'ON' if args.strobe else 'OFF'}  |  양손: {'ON' if args.two_handed else 'OFF'}")
     print("=" * 60)
     process_video(args.url, args.name, is_right_handed=not args.left,
@@ -2120,4 +1905,4 @@ if __name__ == "__main__":
                   strobe=args.strobe, strobe_frames=args.strobe_frames, strobe_step=args.strobe_step,
                   lag_scale=args.lag_scale, no_trail=args.no_trail, two_handed=args.two_handed,
                   audio_impact=args.audio_impact, ball_track=args.ball_track,
-                  impact_frames=args.impact_frame, tracknet_model=args.tracknet_model)
+                  impact_frames=args.impact_frame)
